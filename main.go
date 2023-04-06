@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"istio.io/client-go/pkg/apis/networking/v1alpha3"
 	"istio.io/istio/pkg/kube"
@@ -18,14 +19,21 @@ func main() {
 	kclient, dclient := k8sClients()
 
 	// Get namespaces
-	fmt.Println("Looking for namespaces...")
 	nsList := getNamespaces(kclient)
 
+	// Create the file
+	file, err := os.Create("info.txt")
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	defer file.Close()
+
 	// Get resources per namespace
-	getNsResources(kclient, dclient, nsList)
+	getNsResources(kclient, dclient, nsList, file)
 
 	// Get multicluster service entries
-	getXSE(dclient)
+	getXSE(dclient, file)
 }
 
 func k8sClients() (kubernetes.Interface, dynamic.Interface) {
@@ -63,7 +71,7 @@ func getNamespaces(kclient kubernetes.Interface) []string {
 	return nsNames
 }
 
-func getNsResources(kclient kubernetes.Interface, dclient dynamic.Interface, nsList []string) {
+func getNsResources(kclient kubernetes.Interface, dclient dynamic.Interface, nsList []string, file *os.File) {
 	var (
 		svcNum     int
 		podNum     int
@@ -181,11 +189,16 @@ func getNsResources(kclient kubernetes.Interface, dclient dynamic.Interface, nsL
 		}
 		t2Num = len(t2List.Items)
 
-		fmt.Printf("Namespace %v has %d services, %d pods, %d gateways with %d hostnames, %d virtual services, %d destination rules, %d service entries, %d tier1 gateway pods and %d ingressgateway pods.\n", ns, svcNum, podNum, gwNum, gwHostname, vsNum, drNum, seNum, t1Num, t2Num)
+		info := fmt.Sprintf("Namespace %v has %d services, %d pods, %d gateways with %d hostnames, %d virtual services, %d destination rules, %d service entries, %d tier1 gateway pods and %d ingressgateway pods.\n", ns, svcNum, podNum, gwNum, gwHostname, vsNum, drNum, seNum, t1Num, t2Num)
+		_, err = file.WriteString(info)
+		if err != nil {
+			fmt.Println("Error:", err)
+			return
+		}
 	}
 }
 
-func getXSE(dclient dynamic.Interface) {
+func getXSE(dclient dynamic.Interface, file *os.File) {
 	var mcSe int
 	seRes := schema.GroupVersionResource{
 		Group:    "networking.istio.io",
@@ -200,5 +213,10 @@ func getXSE(dclient dynamic.Interface) {
 	}
 	mcSe = len(seList.Items)
 
-	fmt.Printf("%d multicluster service entries", mcSe)
+	info := fmt.Sprintf("%d multicluster service entries", mcSe)
+	_, err = file.WriteString(info)
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
 }
