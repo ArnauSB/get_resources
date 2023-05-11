@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"sync"
 
 	"istio.io/client-go/pkg/apis/networking/v1alpha3"
 	"istio.io/istio/pkg/kube"
@@ -12,54 +15,88 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/portforward"
+	"k8s.io/client-go/transport/spdy"
 )
 
 func main() {
 	// Get k8s clients
-	kclient, dclient := k8sClients()
+	kclient, dclient, restConfig, err := k8sClients()
+	if err != nil {
+		fmt.Println("error creating the k8s clients:", err)
+		return
+	}
 
-	// Get namespaces
-	nsList := getNamespaces(kclient)
+	// Get namespaces list
+	nsList, err := getNamespaces(kclient)
+	if err != nil {
+		fmt.Println("error getting the list of namespaces:", err)
+		return
+	}
 
-	// Create the file
+	// Create the file to save the data
 	file, err := os.Create("info.txt")
 	if err != nil {
-		fmt.Println("Error:", err)
+		fmt.Println("error creating the file:", err)
 		return
 	}
 	defer file.Close()
 
 	// Get resources per namespace
-	getNsResources(kclient, dclient, nsList, file)
+	err = getNsResources(kclient, dclient, nsList, file)
+	if err != nil {
+		fmt.Println("error getting resources per namespace:", err)
+		return
+	}
 
 	// Get multicluster service entries
 	getXSE(dclient, file)
+	if err != nil {
+		fmt.Println("error getting multicluster SE:", err)
+		return
+	}
+
+	// Get edge pod name
+	edgePod, err := getEdgePod(kclient)
+	if err != nil {
+		fmt.Println("error getting edge pod:", err)
+		return
+	}
+
+	// Get XCP metrics
+	err = portForward(kclient, file, restConfig, edgePod)
+	if err != nil {
+		fmt.Println("error doing port-forwarding:", err)
+		return
+	}
 }
 
-func k8sClients() (kubernetes.Interface, dynamic.Interface) {
+func k8sClients() (*kubernetes.Clientset, dynamic.Interface, *rest.Config, error) {
 	clientcfg := kube.BuildClientCmd("", "")
-	restConfig, errConfig := clientcfg.ClientConfig()
-	if errConfig != nil {
-		panic(fmt.Sprintf("unable to get k8s config file: %v", errConfig))
+	restConfig, err := clientcfg.ClientConfig()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("unable to get k8s config file: %v", err)
 	}
 
 	k8sClient, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
-		panic(err)
+		return nil, nil, nil, fmt.Errorf("unable to create k8s client: %v", err)
 	}
+
 	k8sDynClient, err := dynamic.NewForConfig(restConfig)
 	if err != nil {
-		panic(err)
+		return nil, nil, nil, fmt.Errorf("unable to create k8s dynamic client: %v", err)
 	}
 
-	return k8sClient, k8sDynClient
+	return k8sClient, k8sDynClient, restConfig, nil
 }
 
-func getNamespaces(kclient kubernetes.Interface) []string {
+func getNamespaces(kclient *kubernetes.Clientset) ([]string, error) {
 	var nsNames []string
 	nsList, err := kclient.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
-		panic(err.Error())
+		return nil, fmt.Errorf("unable to get the list of namespaces: %v", err)
 	}
 
 	for _, ns := range nsList.Items {
@@ -68,10 +105,10 @@ func getNamespaces(kclient kubernetes.Interface) []string {
 		}
 	}
 
-	return nsNames
+	return nsNames, nil
 }
 
-func getNsResources(kclient kubernetes.Interface, dclient dynamic.Interface, nsList []string, file *os.File) {
+func getNsResources(kclient *kubernetes.Clientset, dclient dynamic.Interface, nsList []string, file *os.File) error {
 	var (
 		svcNum     int
 		podNum     int
@@ -119,21 +156,21 @@ func getNsResources(kclient kubernetes.Interface, dclient dynamic.Interface, nsL
 		// Get services per namespace
 		svcList, err := kclient.CoreV1().Services(ns).List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
-			panic(err.Error())
+			return err
 		}
 		svcNum = len(svcList.Items)
 
 		// Get pods per namespace
 		podList, err := kclient.CoreV1().Pods(ns).List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
-			panic(err.Error())
+			return err
 		}
 		podNum = len(podList.Items)
 
 		// Get gateways
 		gwList, err := dclient.Resource(gwRes).Namespace(ns).List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
-			panic(err.Error())
+			return err
 		}
 		gwNum = len(gwList.Items)
 
@@ -142,10 +179,8 @@ func getNsResources(kclient kubernetes.Interface, dclient dynamic.Interface, nsL
 			var gwObj v1alpha3.Gateway
 			err = runtime.DefaultUnstructuredConverter.FromUnstructured(gw.Object, &gwObj)
 			if err != nil {
-				panic(err.Error())
+				return err
 			}
-
-			// Esto no va
 			for _, gwCon := range gwObj.Spec.Servers {
 				if gwCon.Port.Number == 15443 {
 					continue
@@ -157,48 +192,49 @@ func getNsResources(kclient kubernetes.Interface, dclient dynamic.Interface, nsL
 		// Get virtual services
 		vsList, err := dclient.Resource(vsRes).Namespace(ns).List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
-			panic(err.Error())
+			return err
 		}
 		vsNum = len(vsList.Items)
 
 		// Get destination rules
 		drList, err := dclient.Resource(drRes).Namespace(ns).List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
-			panic(err.Error())
+			return err
 		}
 		drNum = len(drList.Items)
 
 		// Get service entries
 		seList, err := dclient.Resource(seRes).Namespace(ns).List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
-			panic(err.Error())
+			return err
 		}
 		seNum = len(seList.Items)
 
 		// Get T1 gateways
 		t1List, err := dclient.Resource(t1Res).Namespace(ns).List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
-			panic(err.Error())
+			return err
 		}
 		t1Num = len(t1List.Items)
 
 		// Get ingressgateways
 		t2List, err := dclient.Resource(t2Res).Namespace(ns).List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
-			panic(err.Error())
+			return err
 		}
 		t2Num = len(t2List.Items)
 
 		info := fmt.Sprintf("Namespace %v has %d services, %d pods, %d gateways with %d hostnames, %d virtual services, %d destination rules, %d service entries, %d tier1 gateway pods and %d ingressgateway pods.\n", ns, svcNum, podNum, gwNum, gwHostname, vsNum, drNum, seNum, t1Num, t2Num)
 		_, err = file.WriteString(info)
 		if err != nil {
-			fmt.Println("Error:", err)
-			return
+			return err
 		}
 	}
+
+	return nil
 }
 
-func getXSE(dclient dynamic.Interface, file *os.File) {
+func getXSE(dclient dynamic.Interface, file *os.File) error {
 	var mcSe int
 	seRes := schema.GroupVersionResource{
 		Group:    "networking.istio.io",
@@ -209,14 +245,98 @@ func getXSE(dclient dynamic.Interface, file *os.File) {
 	// Get service entries
 	seList, err := dclient.Resource(seRes).Namespace("xcp-multicluster").List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
-		panic(err.Error())
+		return err
 	}
 	mcSe = len(seList.Items)
 
-	info := fmt.Sprintf("%d multicluster service entries", mcSe)
+	info := fmt.Sprintf("%d multicluster service entries\n", mcSe)
 	_, err = file.WriteString(info)
 	if err != nil {
-		fmt.Println("Error:", err)
-		return
+		return err
 	}
+
+	return nil
+}
+
+func getEdgePod(kclient *kubernetes.Clientset) (string, error) {
+	podList, err := kclient.CoreV1().Pods("istio-system").List(context.TODO(), metav1.ListOptions{LabelSelector: "app=edge"})
+	if err != nil {
+		return "", err
+	}
+
+	if len(podList.Items) == 0 {
+		return "", fmt.Errorf("edge pod does not exist in istio-system namespace")
+	}
+
+	podName := podList.Items[0].Name
+
+	return podName, nil
+}
+
+func portForward(kclient *kubernetes.Clientset, file *os.File, restConfig *rest.Config, podName string) error {
+	// Create the request to do port-forrward
+	req := kclient.CoreV1().RESTClient().Post().Resource("pods").Name(podName).Namespace("istio-system").SubResource("portforward")
+	req.URL().Path = fmt.Sprintf("/api/v1/namespaces/istio-system/pods/%s/portforward", podName)
+
+	// Upgrade the request to a stream connection
+	transport, upgrader, err := spdy.RoundTripperFor(restConfig)
+	if err != nil {
+		return err
+	}
+
+	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, http.MethodPost, req.URL())
+
+	readyCh := make(chan struct{}, 1)
+	stopCh := make(chan struct{}, 1)
+
+	portForwarder, err := portforward.New(dialer, []string{"8080:8080"}, stopCh, readyCh, os.Stdout, os.Stderr)
+	if err != nil {
+		return err
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		err := portForwarder.ForwardPorts()
+		if err != nil {
+			fmt.Printf("error during port-forward: %v", err)
+			return
+		}
+	}()
+
+	<-readyCh
+
+	err = request(file)
+	if err != nil {
+		return err
+	}
+
+	stopCh <- struct{}{}
+
+	wg.Wait()
+
+	return nil
+}
+
+func request(file *os.File) error {
+	resp, err := http.Get("http://localhost:8080/metrics")
+	if err != nil {
+		return fmt.Errorf("error generating the request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("error reading the response: %v", err)
+	}
+
+	_, err = file.Write(body)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
