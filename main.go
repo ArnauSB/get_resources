@@ -21,6 +21,14 @@ import (
 )
 
 func main() {
+	args := os.Args
+	if len(args) < 2 {
+		fmt.Println("Please, provide a cluster name")
+		return
+	}
+	input := args[1]
+	fileName := input + ".txt"
+
 	// Get k8s clients
 	kclient, dclient, restConfig, err := k8sClients()
 	if err != nil {
@@ -36,7 +44,7 @@ func main() {
 	}
 
 	// Create the file to save the data
-	file, err := os.Create("info.txt")
+	file, err := os.Create(fileName)
 	if err != nil {
 		fmt.Println("error creating the file:", err)
 		return
