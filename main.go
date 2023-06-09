@@ -21,6 +21,7 @@ import (
 )
 
 func main() {
+	// Get cluster name to create the file
 	args := os.Args
 	if len(args) < 2 {
 		fmt.Println("Please, provide a cluster name")
@@ -72,8 +73,23 @@ func main() {
 		return
 	}
 
+	// Get central pod name
+	centralPod, err := getCentralPod(kclient)
+	if err != nil {
+		fmt.Println("error getting central pod:", err)
+	}
+
 	// Get XCP metrics
-	err = portForward(kclient, file, restConfig, edgePod)
+	if len(centralPod) > 0 {
+		file.WriteString("\n<<< CENTRAL METRICS >>>\n")
+		err = portForward(kclient, file, restConfig, centralPod, "tsb")
+		if err != nil {
+			fmt.Println("error doing port-forwarding:", err)
+			return
+		}
+	}
+	file.WriteString("\n<<< EDGE METRICS >>>\n")
+	err = portForward(kclient, file, restConfig, edgePod, "istio-system")
 	if err != nil {
 		fmt.Println("error doing port-forwarding:", err)
 		return
@@ -108,7 +124,7 @@ func getNamespaces(kclient *kubernetes.Clientset) ([]string, error) {
 	}
 
 	for _, ns := range nsList.Items {
-		if ns.Name != "kube-system" && ns.Name != "istio-system" && ns.Name != "istio-gateway" && ns.Name != "tsb" && ns.Name != "cert-manager" {
+		if ns.Name != "kube-system" && ns.Name != "istio-system" && ns.Name != "istio-gateway" && ns.Name != "tsb" && ns.Name != "cert-manager" && ns.Name != "xcp-multicluster" {
 			nsNames = append(nsNames, ns.Name)
 		}
 	}
@@ -160,6 +176,8 @@ func getNsResources(kclient *kubernetes.Clientset, dclient dynamic.Interface, ns
 		Resource: "ingressgateways",
 	}
 
+	file.WriteString("Namespace, services, pods, gateways, hostnames x gateway, virtual services, destination rules, service entries, t1gateway pods, t2gateway pods\n")
+
 	for _, ns := range nsList {
 		// Get services per namespace
 		svcList, err := kclient.CoreV1().Services(ns).List(context.TODO(), metav1.ListOptions{})
@@ -183,18 +201,22 @@ func getNsResources(kclient *kubernetes.Clientset, dclient dynamic.Interface, ns
 		gwNum = len(gwList.Items)
 
 		// Get hostname per gateway
-		for _, gw := range gwList.Items {
-			var gwObj v1alpha3.Gateway
-			err = runtime.DefaultUnstructuredConverter.FromUnstructured(gw.Object, &gwObj)
-			if err != nil {
-				return err
-			}
-			for _, gwCon := range gwObj.Spec.Servers {
-				if gwCon.Port.Number == 15443 {
-					continue
+		if gwNum > 0 {
+			for _, gw := range gwList.Items {
+				var gwObj v1alpha3.Gateway
+				err = runtime.DefaultUnstructuredConverter.FromUnstructured(gw.Object, &gwObj)
+				if err != nil {
+					return err
 				}
-				gwHostname = len(gwCon.Hosts)
+				for _, gwCon := range gwObj.Spec.Servers {
+					if gwCon.Port.Number == 15443 {
+						continue
+					}
+					gwHostname = len(gwCon.Hosts)
+				}
 			}
+		} else {
+			gwHostname = 0
 		}
 
 		// Get virtual services
@@ -232,7 +254,7 @@ func getNsResources(kclient *kubernetes.Clientset, dclient dynamic.Interface, ns
 		}
 		t2Num = len(t2List.Items)
 
-		info := fmt.Sprintf("Namespace %v has %d services, %d pods, %d gateways with %d hostnames, %d virtual services, %d destination rules, %d service entries, %d tier1 gateway pods and %d ingressgateway pods.\n", ns, svcNum, podNum, gwNum, gwHostname, vsNum, drNum, seNum, t1Num, t2Num)
+		info := fmt.Sprintf("%v, %d, %d, %d, %d, %d, %d, %d, %d, %d\n", ns, svcNum, podNum, gwNum, gwHostname, vsNum, drNum, seNum, t1Num, t2Num)
 		_, err = file.WriteString(info)
 		if err != nil {
 			return err
@@ -281,10 +303,25 @@ func getEdgePod(kclient *kubernetes.Clientset) (string, error) {
 	return podName, nil
 }
 
-func portForward(kclient *kubernetes.Clientset, file *os.File, restConfig *rest.Config, podName string) error {
+func getCentralPod(kclient *kubernetes.Clientset) (string, error) {
+	podList, err := kclient.CoreV1().Pods("tsb").List(context.TODO(), metav1.ListOptions{LabelSelector: "app=central"})
+	if err != nil {
+		return "", err
+	}
+
+	if len(podList.Items) == 0 {
+		return "", fmt.Errorf("central pod does not exist in tsb namespace")
+	}
+
+	podName := podList.Items[0].Name
+
+	return podName, nil
+}
+
+func portForward(kclient *kubernetes.Clientset, file *os.File, restConfig *rest.Config, podName string, namespace string) error {
 	// Create the request to do port-forrward
-	req := kclient.CoreV1().RESTClient().Post().Resource("pods").Name(podName).Namespace("istio-system").SubResource("portforward")
-	req.URL().Path = fmt.Sprintf("/api/v1/namespaces/istio-system/pods/%s/portforward", podName)
+	req := kclient.CoreV1().RESTClient().Post().Resource("pods").Name(podName).Namespace(namespace).SubResource("portforward")
+	req.URL().Path = fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/portforward", namespace, podName)
 
 	// Upgrade the request to a stream connection
 	transport, upgrader, err := spdy.RoundTripperFor(restConfig)
